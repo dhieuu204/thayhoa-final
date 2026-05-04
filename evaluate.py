@@ -2,8 +2,8 @@ import sys
 import os
 import time
 import numpy as np
-from feature_extraction import SR_TARGET, WINDOW_SEC, get_song_name
-from search import search, load_kdtree, load_norms, load_audio, extract_features, zscore, similarity, TOP_K, K_CAND
+from feature_extraction import SR_TARGET, WINDOW_SEC, get_base_song_name
+from search import search, load_kdtree, load_norms, load_audio, extract_features, zscore, similarity, TOP_K, K_CAND, count_segments_in_db
 
 
 # ─── Precision & Recall ───────────────────────────────────────────────────────
@@ -14,7 +14,7 @@ def precision_recall(results, relevant_names):
     fa = False Accepted    (lay sai)
     fd = False Dismissed   (dung nhung bo sot)
     """
-    retrieved = [r["name"] for r in results]
+    retrieved = [r["path"] for r in results]
     ca = sum(1 for r in retrieved if r in relevant_names)
     fa = len(retrieved) - ca
     fd = len(relevant_names) - ca
@@ -56,26 +56,57 @@ def demo_in_db(query_path, relevant_names=None):
     print("  DEMO CASE 1: FILE DA CO TRONG DB")
     print("=" * 60)
 
-    results    = search(query_path)
-    query_name = get_song_name(query_path)
+    # ── K động: đếm segment của bài này trong DB ──────────────────────────────
+    _, songs  = load_kdtree()
+    base_name = get_base_song_name(query_path)
+    dyn_k     = count_segments_in_db(base_name, songs)
+    if dyn_k == 0:
+        dyn_k = TOP_K
+        print(f"  (Khong tim thay bai '{base_name}' trong DB, dung K mac dinh={dyn_k})")
+
+    # Lấy đủ kết quả cho cả Precision@5 và Recall@K
+    fetch_k = max(5, dyn_k)
+    results = search(query_path, top_k=fetch_k)
 
     top1 = results[0]
     print(f"\n[KIEM TRA] Top 1 co phai chinh no khong?")
     if top1["distance"] < 1e-4:
-        print(f"  DUNG — '{top1['name']}' voi khoang cach = {top1['distance']:.6f}")
+        print(f"  DUNG — '{top1['path']}' voi khoang cach = {top1['distance']:.6f}")
     else:
-        print(f"  SAI  — Top 1 la '{top1['name']}' (distance={top1['distance']:.4f})")
+        print(f"  SAI  — Top 1 la '{top1['path']}' (distance={top1['distance']:.4f})")
 
     if relevant_names is None:
-        relevant_names = [query_name]
+        relevant_names = [query_path]
 
-    metrics = precision_recall(results, relevant_names)
+    metrics = precision_recall(results[:5], relevant_names)
     print(f"\n[DANH GIA]")
     print(f"  Correct Accepted (ca) : {metrics['ca']}")
     print(f"  False Accepted   (fa) : {metrics['fa']}")
     print(f"  False Dismissed  (fd) : {metrics['fd']}")
     print(f"  Precision             : {metrics['precision']:.2%}")
     print(f"  Recall                : {metrics['recall']:.2%}")
+
+    # ── Precision@5: P = ca / (ca + fa) ──────────────────────────────────────
+    ca_5  = sum(1 for r in results[:5] if get_base_song_name(r["path"]) == base_name)
+    fa_5  = 5 - ca_5          # lay sai: khong dung bai nhung he thong chon
+    p_5   = ca_5 / (ca_5 + fa_5) if (ca_5 + fa_5) > 0 else 0.0
+
+    # ── Recall@K:  R = ca / (ca + fd) ─────────────────────────────────────────
+    ca_k  = sum(1 for r in results[:dyn_k] if get_base_song_name(r["path"]) == base_name)
+    fd_k  = dyn_k - ca_k      # loai bo sai: dung bai nhung he thong bo qua
+    r_k   = ca_k / (ca_k + fd_k) if (ca_k + fd_k) > 0 else 0.0
+
+    print(f"\n[DANH GIA SONG-LEVEL]")
+    print(f"  Bai goc (query)       : {base_name}")
+    print(f"  K dong                : {dyn_k}  (tong segment cua bai trong DB)")
+    print(f"  --- Precision@5 (top 5 co dang tin khong?) ---")
+    print(f"  ca (chon dung)        : {ca_5}")
+    print(f"  fa (chon sai)         : {fa_5}")
+    print(f"  Precision@5           : {ca_5}/{ca_5+fa_5} = {p_5:.2%}")
+    print(f"  --- Recall@{dyn_k} (tim duoc bao nhieu segment?) ---")
+    print(f"  ca (tim duoc dung)    : {ca_k}")
+    print(f"  fd (bo sot)           : {fd_k}")
+    print(f"  Recall@{dyn_k:<5}          : {ca_k}/{ca_k+fd_k} = {r_k:.2%}")
 
     return results, metrics
 
@@ -89,7 +120,7 @@ def demo_out_db(query_path, relevant_names=None):
 
     results = search(query_path)
     top1    = results[0]
-    print(f"\n[KIEM TRA] Bai gan nhat: '{top1['name']}' (score={top1['score']:.4f})")
+    print(f"\n[KIEM TRA] File gan nhat: '{top1['path']}' (score={top1['score']:.4f})")
 
     if relevant_names:
         metrics = precision_recall(results, relevant_names)
@@ -154,5 +185,5 @@ if __name__ == "__main__":
     else:
         print("Cach dung:")
         print("  python evaluate.py in   <file.wav>")
-        print("  python evaluate.py out  <file.wav> [ten1,ten2,...]")
+        print("  python evaluate.py out  <file.wav> [path1,path2,...]")
         print("  python evaluate.py bench <file.wav>")

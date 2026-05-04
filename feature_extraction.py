@@ -10,7 +10,7 @@ from scipy.io import wavfile
 from scipy.signal import resample_poly
 from scipy.spatial import KDTree
 from math import gcd
-import pyodbc
+import pymysql
 
 # ──────────────────────────────────────────────────────────────────────────────
 DATASET_DIR = "dataset"
@@ -22,51 +22,51 @@ STEP_SEC    = 2.5
 N_WORKERS   = 8
 N_DIM       = 6
 
-# SQL Server — chỉnh SERVER/DATABASE nếu cần
-SQL_CONN = (
-    "DRIVER={SQL Server};"
-    "SERVER=LAPTOP-2SBQ267U\\SQLEXPRESS;"
-    "DATABASE=MusicDB;"
-    "Trusted_Connection=yes;"
-)
+DB_CONFIG = {
+    "host":     "127.0.0.1",
+    "port":     3306,
+    "user":     "root",
+    "password": "kali",
+    "database": "MusicDB",
+    "charset":  "utf8mb4",
+}
 
 
-# ─── SQL Server ───────────────────────────────────────────────────────────────
+# ─── MySQL ────────────────────────────────────────────────────────────────────
 
 def get_conn():
-    return pyodbc.connect(SQL_CONN)
+    return pymysql.connect(**DB_CONFIG)
 
 
 def init_db(conn):
-    conn.execute("""
-        IF NOT EXISTS (
-            SELECT * FROM sys.objects
-            WHERE object_id = OBJECT_ID(N'frames') AND type = 'U'
-        )
-        CREATE TABLE frames (
-            id            INT IDENTITY(1,1) PRIMARY KEY,
-            song_name     NVARCHAR(500)  NOT NULL,
-            file_path     NVARCHAR(1000) NOT NULL,
-            offset_sec    FLOAT          NOT NULL,
-            pitch         FLOAT,
-            zcr           FLOAT,
-            energy        FLOAT,
-            centroid      FLOAT,
-            bandwidth     FLOAT,
-            harmonicity   FLOAT,
-            z_pitch       FLOAT,
-            z_zcr         FLOAT,
-            z_energy      FLOAT,
-            z_centroid    FLOAT,
-            z_bandwidth   FLOAT,
-            z_harmonicity FLOAT
-        )
-    """)
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS frames (
+                id            INT AUTO_INCREMENT PRIMARY KEY,
+                song_name     VARCHAR(500)  NOT NULL,
+                file_path     VARCHAR(1000) NOT NULL,
+                offset_sec    DOUBLE        NOT NULL,
+                pitch         DOUBLE,
+                zcr           DOUBLE,
+                energy        DOUBLE,
+                centroid      DOUBLE,
+                bandwidth     DOUBLE,
+                harmonicity   DOUBLE,
+                z_pitch       DOUBLE,
+                z_zcr         DOUBLE,
+                z_energy      DOUBLE,
+                z_centroid    DOUBLE,
+                z_bandwidth   DOUBLE,
+                z_harmonicity DOUBLE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
     conn.commit()
 
 
 def get_existing_paths(conn):
-    rows = conn.execute("SELECT DISTINCT file_path FROM frames").fetchall()
+    with conn.cursor() as cur:
+        cur.execute("SELECT DISTINCT file_path FROM frames")
+        rows = cur.fetchall()
     return set(r[0] for r in rows)
 
 
@@ -78,43 +78,47 @@ def insert_batch(conn, rows):
          None, None, None, None, None, None)
         for name, fp, offset, feat in rows
     ]
-    cursor = conn.cursor()
-    cursor.executemany("""
-        INSERT INTO frames
-            (song_name, file_path, offset_sec,
-             pitch, zcr, energy, centroid, bandwidth, harmonicity,
-             z_pitch, z_zcr, z_energy, z_centroid, z_bandwidth, z_harmonicity)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    """, data)
+    with conn.cursor() as cursor:
+        cursor.executemany("""
+            INSERT INTO frames
+                (song_name, file_path, offset_sec,
+                 pitch, zcr, energy, centroid, bandwidth, harmonicity,
+                 z_pitch, z_zcr, z_energy, z_centroid, z_bandwidth, z_harmonicity)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, data)
     conn.commit()
 
 
 def load_all_raw(conn):
-    return conn.execute("""
-        SELECT id, song_name, file_path, offset_sec,
-               pitch, zcr, energy, centroid, bandwidth, harmonicity
-        FROM frames ORDER BY id
-    """).fetchall()
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT id, song_name, file_path, offset_sec,
+                   pitch, zcr, energy, centroid, bandwidth, harmonicity
+            FROM frames ORDER BY id
+        """)
+        return cur.fetchall()
 
 
 def update_zscores(conn, updates):
     """updates: list of (z_pitch, z_zcr, z_energy, z_centroid, z_bw, z_harm, id)"""
-    cursor = conn.cursor()
-    cursor.executemany("""
-        UPDATE frames SET
-            z_pitch=?, z_zcr=?, z_energy=?,
-            z_centroid=?, z_bandwidth=?, z_harmonicity=?
-        WHERE id=?
-    """, updates)
+    with conn.cursor() as cursor:
+        cursor.executemany("""
+            UPDATE frames SET
+                z_pitch=%s, z_zcr=%s, z_energy=%s,
+                z_centroid=%s, z_bandwidth=%s, z_harmonicity=%s
+            WHERE id=%s
+        """, updates)
     conn.commit()
 
 
 def load_zscores(conn):
-    rows = conn.execute("""
-        SELECT id, song_name, file_path, offset_sec,
-               z_pitch, z_zcr, z_energy, z_centroid, z_bandwidth, z_harmonicity
-        FROM frames ORDER BY id
-    """).fetchall()
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT id, song_name, file_path, offset_sec,
+                   z_pitch, z_zcr, z_energy, z_centroid, z_bandwidth, z_harmonicity
+            FROM frames ORDER BY id
+        """)
+        rows = cur.fetchall()
     return [
         {
             "id": r[0], "name": r[1], "path": r[2], "offset": r[3],
@@ -131,6 +135,13 @@ def get_song_name(file_path):
     stem = os.path.splitext(os.path.basename(file_path))[0]
     name = re.sub(r'^IRMAS-[^_]+__[^_]+__', '', stem).strip()
     return name if name else stem
+
+
+def get_base_song_name(file_path):
+    """Bỏ phần số segment đuôi: 'Avocet-13.wav' → 'Avocet'."""
+    import re
+    name = get_song_name(file_path)
+    return re.sub(r'-\d+$', '', name)
 
 
 # ─── Load audio ───────────────────────────────────────────────────────────────
@@ -321,7 +332,8 @@ def build_database(reset=False):
     conn = get_conn()
 
     if reset:
-        conn.execute("IF OBJECT_ID('frames','U') IS NOT NULL DROP TABLE frames")
+        with conn.cursor() as cur:
+            cur.execute("DROP TABLE IF EXISTS frames")
         conn.commit()
         for f in [KDTREE_FILE, NORMS_FILE]:
             if os.path.exists(f):
@@ -403,7 +415,7 @@ def build_database(reset=False):
     print(f"So chieu vector    : {N_DIM}")
     print(f"KD-Tree            : {KDTREE_FILE}")
     print(f"Norms (mu/sigma)   : {NORMS_FILE}")
-    print(f"SQL Server table   : frames")
+    print(f"MySQL table        : frames")
 
 
 if __name__ == "__main__":
