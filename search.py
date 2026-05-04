@@ -1,16 +1,21 @@
 import sys
 import os
 import time
+import json
 import pickle
 import numpy as np
-import librosa
-from feature_extraction import extract_features, SR, WINDOW_SEC, DB_FILE, KDTREE_FILE
+from feature_extraction import (
+    load_audio, extract_features, zscore,
+    get_song_name, SR_TARGET, WINDOW_SEC, STEP_SEC,
+    KDTREE_FILE, NORMS_FILE
+)
 
 TOP_K   = 5
-MIN_SEC = 3.0   # file query toi thieu 3 giay
+MIN_SEC = 3.0
+K_CAND  = 10   # số frame ứng viên mỗi query frame — kien.md bước 3
 
 
-# ─── Load KD-Tree ─────────────────────────────────────────────────────────────
+# ─── Load KD-Tree & norms ─────────────────────────────────────────────────────
 
 def load_kdtree():
     if not os.path.exists(KDTREE_FILE):
@@ -21,112 +26,149 @@ def load_kdtree():
     return data["tree"], data["songs"]
 
 
-# ─── Chuan bi query vector ────────────────────────────────────────────────────
-
-def load_query(query_path):
-    """
-    Doc file query, cat lay doan WINDOW_SEC giay dau tien.
-    Neu ngan hon WINDOW_SEC thi tile (pad) len du do dai.
-    """
-    duration = librosa.get_duration(path=query_path)
-    if duration < MIN_SEC:
-        print(f"Query qua ngan ({duration:.1f}s). Can it nhat {MIN_SEC}s.")
+def load_norms():
+    if not os.path.exists(NORMS_FILE):
+        print(f"Chua co {NORMS_FILE}. Hay chay: python main.py build")
         sys.exit(1)
-
-    audio, sr  = librosa.load(query_path, sr=SR, mono=True)
-    target_len = int(WINDOW_SEC * sr)
-
-    if len(audio) < target_len:
-        # Pad bang cach lap lai am thanh
-        audio = np.tile(audio, int(np.ceil(target_len / len(audio))))
-
-    return audio[:target_len], sr
+    with open(NORMS_FILE) as f:
+        d = json.load(f)
+    return d["mu"], d["sigma"]
 
 
-# ─── Tinh do tuong dong Cosine tu L2 cua unit vector ─────────────────────────
+# ─── Đo khoảng cách & độ tương đồng ──────────────────────────────────────────
 
-def l2_to_cosine(dist):
+def l2_distance(a, b):
+    """L2-norm — Slide 8, trang 17
+    L2(Di, Dj) = sqrt( Σ (z_ik - z_jk)² )
     """
-    Cong thuc chinh xac: neu q va d deu la unit vector,
-    thi  ||q - d||^2 = 2 - 2*cos(theta)
-    => cos(theta) = 1 - dist^2 / 2
+    diff = a - b
+    return float(np.sqrt(np.sum(diff * diff)))
+
+
+def similarity(dist):
+    """Độ tương đồng — kien.md phần 6
+    sim = 1 / (1 + L2)
+    sim = 1  → giống hoàn toàn
+    sim → 0  → càng khác nhau
     """
-    return float(max(0.0, 1.0 - (dist ** 2) / 2.0))
+    return 1.0 / (1.0 + dist)
 
 
-# ─── Ham search chinh ─────────────────────────────────────────────────────────
+# ─── Hàm search chính ────────────────────────────────────────────────────────
 
 def search(query_path):
-    print("=" * 55)
+    print("=" * 60)
     print(f"FILE TRUY VAN : {os.path.basename(query_path)}")
-    print(f"DO DO         : Cosine Similarity (qua KD-Tree + unit norm)")
-    print("=" * 55)
+    print(f"DO DO         : sim = 1/(1+L2)  |  Chuan hoa: Z-score")
+    print("=" * 60)
 
-    # Buoc 1: Trich xuat vector query
-    print("\n[1] Trich xuat dac trung file truy van...")
-    t0          = time.time()
-    audio, sr   = load_query(query_path)
-    q_vec       = np.array(extract_features(audio, sr), dtype=np.float32)
-    t_extract   = time.time() - t0
-
-    labels = ["Pitch(Hz)", "ZCR", "Energy", "Centroid", "Bandwidth"] + \
-             [f"MFCC_{i}" for i in range(1, 14)]
-    print(f"    Thoi gian trich xuat : {t_extract:.2f}s")
-    print(f"    Vector {len(q_vec)} chieu (da chuan hoa unit norm):")
-    for label, val in zip(labels[:5], q_vec[:5]):
-        print(f"      {label:12s} = {val:.6f}")
-    print(f"      MFCC_1..13   = [{', '.join(f'{v:.3f}' for v in q_vec[5:])}]")
-
-    # Buoc 2: Tim kiem bang KD-Tree
-    print(f"\n[2] Tim kiem {TOP_K} lang gieng gan nhat (KD-Tree, Cosine)...")
+    mu, sigma   = load_norms()
     tree, songs = load_kdtree()
 
-    t0 = time.time()
-    # KD-Tree dung khoang cach L2 tren unit vector → tuong duong Cosine
-    k_query          = min(TOP_K * 10, len(songs))   # lay nhieu hon de dedup
-    distances, idxs  = tree.query(q_vec, k=k_query, p=2)
-    t_search         = time.time() - t0
+    # ── Bước 1: cửa sổ trượt file query ──────────────────────────────────────
+    audio, sr = load_audio(query_path)
+    duration  = len(audio) / sr
+    if duration < MIN_SEC:
+        print(f"File qua ngan ({duration:.1f}s). Can it nhat {MIN_SEC}s.")
+        sys.exit(1)
 
-    print(f"    So windows trong DB  : {len(songs)}")
-    print(f"    Thoi gian tim kiem   : {t_search * 1000:.3f}ms")
+    window_len = int(WINDOW_SEC * sr)
+    step_len   = int(STEP_SEC   * sr)
 
-    # Buoc 3: Ket qua trung gian — top windows tim duoc
-    print(f"\n[3] Ket qua trung gian (top windows):")
-    print(f"    {'STT':<5} {'Cosine':>8}  {'Offset':>7}  Ten bai")
-    print(f"    {'-'*55}")
-    for rank, (dist, idx) in enumerate(zip(distances[:15], idxs[:15]), 1):
-        s   = songs[idx]
-        cos = l2_to_cosine(dist)
-        marker = " <- CHINH NO" if dist < 1e-4 else ""
-        print(f"    {rank:<5} {cos:>7.4f}  {s['offset']:>5.1f}s  {s['name'][:35]}{marker}")
+    # Pad nếu ngắn hơn 1 window (lặp lại tín hiệu)
+    if len(audio) < window_len:
+        repeats = int(np.ceil(window_len / len(audio)))
+        audio   = np.tile(audio, repeats)
 
-    # Buoc 4: Dedup — giu moi bai 1 lan (window co cosine cao nhat)
-    seen = {}
-    for dist, idx in zip(distances, idxs):
-        s   = songs[idx]
-        cos = l2_to_cosine(dist)
-        if s["name"] not in seen or cos > seen[s["name"]]["similarity"]:
-            seen[s["name"]] = {**s, "distance": float(dist), "similarity": cos}
+    q_frames = []
+    for start in range(0, len(audio) - window_len + 1, step_len):
+        q_frames.append(audio[start: start + window_len])
+    if not q_frames:
+        q_frames = [audio[:window_len]]
 
-    top5 = sorted(seen.values(), key=lambda x: -x["similarity"])[:TOP_K]
+    Q = len(q_frames)
+    print(f"\n[1] File query -> {Q} frame  (window={WINDOW_SEC}s, step={STEP_SEC}s)")
 
-    # Buoc 5: Hien thi ket qua cuoi
+    # ── Bước 2 & 3: mỗi frame → trích xuất + Z-score → KD-tree ──────────────
+    labels = ["Pitch", "ZCR", "Energy", "Centroid", "Bandwidth", "Harmony"]
+    print(f"\n[2] Trich xuat + Z-score + KD-tree ({K_CAND} ung vien/frame)...")
+
+    t0    = time.time()
+    score = {}   # song_name → tổng sim tích lũy
+    best  = {}   # song_name → thông tin frame match tốt nhất
+
+    for i, frame in enumerate(q_frames):
+        # Bước 2: trích xuất 6 thuộc tính
+        raw  = extract_features(frame, sr)
+        # Z-score dùng mu/sigma đã lưu từ lúc build
+        zvec = np.array(zscore(raw, mu, sigma), dtype=np.float32)
+
+        if i == 0:
+            print(f"\n    Frame 0 — vector raw  : {[f'{v:.4f}' for v in raw]}")
+            print(f"    Frame 0 — vector Z    : {[f'{v:.4f}' for v in zvec]}")
+            print(f"    {'Label':<12}: {'raw':>10}  {'z-score':>10}")
+            print(f"    {'-'*36}")
+            for lbl, rv, zv in zip(labels, raw, zvec):
+                print(f"    {lbl:<12}: {rv:>10.4f}  {zv:>10.4f}")
+
+        # Bước 3: KD-tree tìm K_CAND frame gần nhất
+        k_query = min(K_CAND, len(songs))
+        dists, idxs = tree.query(zvec, k=k_query, p=2)
+
+        # Dedup: mỗi bài chỉ lấy frame tốt nhất trong query frame này
+        best_this_frame = {}
+        for dist, idx in zip(dists, idxs):
+            s    = songs[idx]
+            name = s["name"]
+            sim  = similarity(dist)
+            if name not in best_this_frame or sim > best_this_frame[name]["sim"]:
+                best_this_frame[name] = {"s": s, "sim": sim, "dist": dist}
+
+        # Bước 4: cộng dồn điểm (mỗi bài tối đa 1 lần / query frame)
+        for name, info in best_this_frame.items():
+            score[name] = score.get(name, 0.0) + info["sim"]
+            if name not in best or info["sim"] > best[name]["similarity"]:
+                best[name] = {**info["s"], "distance": float(info["dist"]), "similarity": info["sim"]}
+
+    t_search = time.time() - t0
+
+    # ── Bước 5: chuẩn hóa điểm theo số frame query ───────────────────────────
+    for name in score:
+        score[name] /= Q
+
+    print(f"\n    Tong frame query (Q)  : {Q}")
+    print(f"    So bai ung vien       : {len(score)}")
+    print(f"    Thoi gian tim kiem    : {t_search*1000:.2f}ms")
+    print(f"    So windows trong DB   : {len(songs)}")
+
+    # ── Bước 6: sắp xếp → Top 5 ──────────────────────────────────────────────
+    sorted_cands = sorted(score.items(), key=lambda x: -x[1])
+
+    print(f"\n[3] Ket qua trung gian (score gom tu {Q} frame, chuan hoa /Q):")
+    print(f"    {'STT':<5} {'Score':>8}  Ten bai")
+    print(f"    {'-'*52}")
+    for rank, (name, sc) in enumerate(sorted_cands[:10], 1):
+        print(f"    {rank:<5} {sc:>8.4f}  {name}")
+
+    top5 = []
+    for name, sc in sorted_cands[:TOP_K]:
+        top5.append({**best[name], "score": sc})
+
     print(f"\n[4] KET QUA TOP {TOP_K} BAI NHAC TUONG DONG:")
-    print(f"    {'Hang':<6} {'Cosine':>8}  {'Tuong dong':>12}  Ten bai")
-    print(f"    {'-'*60}")
+    print(f"    {'Hang':<6} {'Score':>8}  {'%':>8}  Ten bai")
+    print(f"    {'-'*62}")
     for rank, r in enumerate(top5, 1):
-        pct = r["similarity"] * 100
-        print(f"    {rank:<6} {r['similarity']:>8.4f}  {pct:>11.2f}%  {r['name']}")
+        pct = r["score"] * 100
+        print(f"    {rank:<6} {r['score']:>8.4f}  {pct:>7.2f}%  {r['name']}")
         print(f"           File: {r['path']}")
 
-    print("=" * 55)
+    print("=" * 60)
     return top5
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Cach dung: python search.py <file_audio.wav>")
-        print("Vi du    : python search.py query.wav")
         sys.exit(1)
     if not os.path.exists(sys.argv[1]):
         print(f"Khong tim thay file: {sys.argv[1]}")
